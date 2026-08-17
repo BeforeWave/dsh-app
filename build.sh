@@ -994,8 +994,129 @@ static NSString * const DSHURLString = @"http://127.0.0.1:3080";
 
 @implementation DSHAppDelegate
 
+- (void)installMainMenu {
+    NSMenu *mainMenu = [[NSMenu alloc] initWithTitle:@""];
+
+    // Application menu
+    NSMenuItem *appMenuItem =
+        [[NSMenuItem alloc] initWithTitle:@""
+                                  action:nil
+                           keyEquivalent:@""];
+
+    NSMenu *appMenu = [[NSMenu alloc] initWithTitle:@"DS Harness"];
+
+    NSMenuItem *aboutItem =
+        [[NSMenuItem alloc] initWithTitle:@"About DS Harness"
+                                  action:@selector(orderFrontStandardAboutPanel:)
+                           keyEquivalent:@""];
+    aboutItem.target = NSApp;
+    [appMenu addItem:aboutItem];
+
+    [appMenu addItem:[NSMenuItem separatorItem]];
+
+    NSMenuItem *hideItem =
+        [[NSMenuItem alloc] initWithTitle:@"Hide DS Harness"
+                                  action:@selector(hide:)
+                           keyEquivalent:@"h"];
+    hideItem.target = NSApp;
+    [appMenu addItem:hideItem];
+
+    NSMenuItem *hideOthersItem =
+        [[NSMenuItem alloc] initWithTitle:@"Hide Others"
+                                  action:@selector(hideOtherApplications:)
+                           keyEquivalent:@"h"];
+    hideOthersItem.target = NSApp;
+    hideOthersItem.keyEquivalentModifierMask =
+        NSEventModifierFlagCommand | NSEventModifierFlagOption;
+    [appMenu addItem:hideOthersItem];
+
+    NSMenuItem *showAllItem =
+        [[NSMenuItem alloc] initWithTitle:@"Show All"
+                                  action:@selector(unhideAllApplications:)
+                           keyEquivalent:@""];
+    showAllItem.target = NSApp;
+    [appMenu addItem:showAllItem];
+
+    [appMenu addItem:[NSMenuItem separatorItem]];
+
+    NSMenuItem *quitItem =
+        [[NSMenuItem alloc] initWithTitle:@"Quit DS Harness"
+                                  action:@selector(terminate:)
+                           keyEquivalent:@"q"];
+    quitItem.target = NSApp;
+    [appMenu addItem:quitItem];
+
+    appMenuItem.submenu = appMenu;
+    [mainMenu addItem:appMenuItem];
+
+    // Edit menu.
+    // Targets are nil intentionally: AppKit routes these actions through the
+    // responder chain, so the focused WKWebView/editable element receives them.
+    NSMenuItem *editMenuItem =
+        [[NSMenuItem alloc] initWithTitle:@"Edit"
+                                  action:nil
+                           keyEquivalent:@""];
+
+    NSMenu *editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
+
+    NSMenuItem *undoItem =
+        [[NSMenuItem alloc] initWithTitle:@"Undo"
+                                  action:@selector(undo:)
+                           keyEquivalent:@"z"];
+    undoItem.target = nil;
+    [editMenu addItem:undoItem];
+
+    NSMenuItem *redoItem =
+        [[NSMenuItem alloc] initWithTitle:@"Redo"
+                                  action:@selector(redo:)
+                           keyEquivalent:@"z"];
+    redoItem.target = nil;
+    redoItem.keyEquivalentModifierMask =
+        NSEventModifierFlagCommand | NSEventModifierFlagShift;
+    [editMenu addItem:redoItem];
+
+    [editMenu addItem:[NSMenuItem separatorItem]];
+
+    NSMenuItem *cutItem =
+        [[NSMenuItem alloc] initWithTitle:@"Cut"
+                                  action:@selector(cut:)
+                           keyEquivalent:@"x"];
+    cutItem.target = nil;
+    [editMenu addItem:cutItem];
+
+    NSMenuItem *copyItem =
+        [[NSMenuItem alloc] initWithTitle:@"Copy"
+                                  action:@selector(copy:)
+                           keyEquivalent:@"c"];
+    copyItem.target = nil;
+    [editMenu addItem:copyItem];
+
+    NSMenuItem *pasteItem =
+        [[NSMenuItem alloc] initWithTitle:@"Paste"
+                                  action:@selector(paste:)
+                           keyEquivalent:@"v"];
+    pasteItem.target = nil;
+    [editMenu addItem:pasteItem];
+
+    [editMenu addItem:[NSMenuItem separatorItem]];
+
+    NSMenuItem *selectAllItem =
+        [[NSMenuItem alloc] initWithTitle:@"Select All"
+                                  action:@selector(selectAll:)
+                           keyEquivalent:@"a"];
+    selectAllItem.target = nil;
+    [editMenu addItem:selectAllItem];
+
+    editMenuItem.submenu = editMenu;
+    [mainMenu addItem:editMenuItem];
+
+    [NSApp setMainMenu:mainMenu];
+}
+
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     (void)notification;
+
+    [self installMainMenu];
 
     self.launcherPath =
         [[[NSBundle mainBundle] resourcePath]
