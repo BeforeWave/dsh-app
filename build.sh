@@ -95,6 +95,7 @@ find_cmd() {
 }
 
 backend_up() {
+  # Build-time health check is intentionally independent of desktop config.
   /usr/bin/curl -fsS --max-time 1 "$URL/" >/dev/null 2>&1
 }
 
@@ -423,6 +424,8 @@ VERSION_FILE="$SUPPORT_DIR/version"
 LAUNCHER_BUILD_ID_FILE="$SUPPORT_DIR/launcher-build-id"
 DSH_HOME_DIR="$HOME/.dsh"
 
+CONFIG_DIR="$HOME/.config/dsh-desktop"
+
 # Replaced by the maintainer build script with a SHA-256 hash of the embedded
 # launcher logic. If the launcher logic changes in a future app build, the
 # managed backend is restarted with freshly generated runtime files.
@@ -437,6 +440,44 @@ LEGACY_LABELS=(
 LEGACY_SUPPORT_DIR="$HOME/Library/Application Support/DSH"
 
 mkdir -p "$SUPPORT_DIR" "$LOG_DIR" "$DSH_HOME_DIR"
+
+source_extension_env() {
+  # DS Harness never creates or mutates ~/.config/dsh-desktop.
+  # The repository/user-owned config is read directly.
+  set +u
+  if [ -f "$CONFIG_DIR/env.sh" ]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_DIR/env.sh"
+  fi
+  set -u
+}
+
+run_config_hooks() {
+  local hook_dir_name="$1"
+  local hook_dir="$CONFIG_DIR/$hook_dir_name"
+  local hook
+  local status=0
+
+  for hook in "$hook_dir"/*.sh; do
+    [ -f "$hook" ] || continue
+
+    echo "DS Harness extension hook: $hook" >>"$LOG_DIR/extensions.log"
+    if ! /bin/bash "$hook" >>"$LOG_DIR/extensions.log" 2>&1; then
+      status=1
+      echo "DS Harness extension hook failed: $hook" >>"$LOG_DIR/extensions.log"
+    fi
+  done
+
+  return "$status"
+}
+
+source_extension_env
+
+export DSH_DESKTOP_CONFIG_DIR="$CONFIG_DIR"
+export DSH_DESKTOP_SUPPORT_DIR="$SUPPORT_DIR"
+export DSH_DESKTOP_LOG_DIR="$LOG_DIR"
+export DSH_DESKTOP_SERVICE_LABEL="$LABEL"
+export DSH_DESKTOP_URL="$URL"
 
 dialog_error() {
   MSG="$1" /usr/bin/osascript <<'EOF' >/dev/null 2>&1
@@ -480,6 +521,11 @@ find_command() {
 }
 
 backend_up() {
+  if [ -f "$CONFIG_DIR/healthcheck.sh" ]; then
+    /bin/bash "$CONFIG_DIR/healthcheck.sh"
+    return $?
+  fi
+
   /usr/bin/curl -fsS --max-time 1 "$URL/" >/dev/null 2>&1
 }
 
@@ -682,6 +728,16 @@ export HOME="${HOME:?HOME is missing}"
 export DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
 export PATH="$runtime_path"
 
+# launchd does not inherit the launcher process environment, so source the
+# same repository/user-owned desktop config here as well.
+DESKTOP_CONFIG_DIR="$HOME/.config/dsh-desktop"
+set +u
+if [ -f "$DESKTOP_CONFIG_DIR/env.sh" ]; then
+  # shellcheck disable=SC1090
+  source "$DESKTOP_CONFIG_DIR/env.sh"
+fi
+set -u
+
 echo "DSH Launcher HOME: $HOME" >&2
 echo "DSH Launcher DSH_HOME: $DSH_HOME" >&2
 echo "DSH Launcher settings: $DSH_HOME/settings.yaml" >&2
@@ -810,6 +866,14 @@ ensure_backend() {
   # Reuse it and never kill arbitrary user processes.
   if backend_up; then
     return 0
+  fi
+
+  if ! run_config_hooks "pre-start.d"; then
+    dialog_error "A pre-start extension hook failed.
+
+Check:
+$LOG_DIR/extensions.log"
+    return 1
   fi
 
   configure_runtime || return 1
@@ -952,10 +1016,71 @@ if ! ensure_backend; then
   exit 1
 fi
 
+# Post-ready hooks are best-effort: they must never prevent the desktop UI
+# from opening once DSH itself is healthy.
+run_config_hooks "post-ready.d" || true
+
 check_update_async
 
 exit 0
 LAUNCHER
+
+# ─────────────────────────────────────────────
+# STEP 4.1: Embed the menu command runner only.
+#
+# No env/hooks/healthcheck/menu command files are generated or copied into
+# the app bundle. All extension configuration is read directly from:
+#   ~/.config/dsh-desktop
+# ─────────────────────────────────────────────
+
+cat > "$RESOURCES/run-command.sh" <<'EOF'
+#!/bin/bash
+set -u
+
+if [ "$#" -ne 1 ]; then
+  echo "usage: run-command.sh <command-script>" >&2
+  exit 64
+fi
+
+COMMAND_SCRIPT="$1"
+CONFIG_DIR="$HOME/.config/dsh-desktop"
+
+SUPPORT_DIR="$HOME/Library/Application Support/DS Harness"
+LOG_DIR="$HOME/Library/Logs/DS Harness"
+LABEL="com.beforewave.ds-harness.web"
+URL="http://127.0.0.1:3080"
+
+mkdir -p "$LOG_DIR"
+
+export DSH_DESKTOP_CONFIG_DIR="$CONFIG_DIR"
+export DSH_DESKTOP_SUPPORT_DIR="$SUPPORT_DIR"
+export DSH_DESKTOP_LOG_DIR="$LOG_DIR"
+export DSH_DESKTOP_SERVICE_LABEL="$LABEL"
+export DSH_DESKTOP_URL="$URL"
+export DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
+
+set +u
+if [ -f "$CONFIG_DIR/env.sh" ]; then
+  # shellcheck disable=SC1090
+  source "$CONFIG_DIR/env.sh"
+fi
+set -u
+
+if [ ! -f "$COMMAND_SCRIPT" ]; then
+  echo "DS Harness menu command does not exist: $COMMAND_SCRIPT"     >>"$LOG_DIR/commands.log"
+  exit 66
+fi
+
+{
+  echo "[$(/bin/date '+%Y-%m-%d %H:%M:%S')] $COMMAND_SCRIPT"
+  /bin/bash "$COMMAND_SCRIPT"
+  status=$?
+  echo "exit=$status"
+  exit "$status"
+} >>"$LOG_DIR/commands.log" 2>&1
+EOF
+
+chmod +x "$RESOURCES/run-command.sh"
 
 # Use the embedded launcher content itself as the managed-runtime revision.
 # This avoids relying on a manually maintained migration/version number.
@@ -987,6 +1112,7 @@ static NSString * const DSHURLString = @"http://127.0.0.1:3080";
     <NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate>
 @property(nonatomic, strong) NSWindow *window;
 @property(nonatomic, strong) WKWebView *webView;
+@property(nonatomic, strong) NSStatusItem *statusItem;
 @property(nonatomic, copy) NSString *launcherPath;
 @property(nonatomic, assign) BOOL launcherRunning;
 @property(nonatomic, assign) BOOL backendReady;
@@ -994,10 +1120,316 @@ static NSString * const DSHURLString = @"http://127.0.0.1:3080";
 
 @implementation DSHAppDelegate
 
+- (NSDictionary *)menuCommandMetadataAtPath:(NSString *)path {
+    NSError *error = nil;
+    NSString *content =
+        [NSString stringWithContentsOfFile:path
+                                  encoding:NSUTF8StringEncoding
+                                     error:&error];
+
+    if (content == nil) {
+        return nil;
+    }
+
+    NSMutableDictionary *metadata = [NSMutableDictionary dictionary];
+    metadata[@"order"] = @100;
+
+    NSArray<NSString *> *lines =
+        [content componentsSeparatedByCharactersInSet:
+            [NSCharacterSet newlineCharacterSet]];
+
+    for (NSString *rawLine in lines) {
+        NSString *line =
+            [rawLine stringByTrimmingCharactersInSet:
+                [NSCharacterSet whitespaceCharacterSet]];
+
+        if (line.length == 0) {
+            continue;
+        }
+
+        if (![line hasPrefix:@"#"]) {
+            break;
+        }
+
+        if (![line hasPrefix:@"# @"]) {
+            continue;
+        }
+
+        NSString *body =
+            [line substringFromIndex:3];
+
+        NSRange space = [body rangeOfCharacterFromSet:
+            [NSCharacterSet whitespaceCharacterSet]];
+
+        NSString *key = nil;
+        NSString *value = @"";
+
+        if (space.location == NSNotFound) {
+            key = body.lowercaseString;
+        } else {
+            key = [[body substringToIndex:space.location] lowercaseString];
+            value =
+                [[body substringFromIndex:NSMaxRange(space)]
+                    stringByTrimmingCharactersInSet:
+                        [NSCharacterSet whitespaceCharacterSet]];
+        }
+
+        if ([key isEqualToString:@"menu"]) {
+            metadata[@"title"] = value;
+        } else if ([key isEqualToString:@"shortcut"]) {
+            metadata[@"shortcut"] = value;
+        } else if ([key isEqualToString:@"order"]) {
+            metadata[@"order"] = @([value integerValue]);
+        } else if ([key isEqualToString:@"separator"]) {
+            metadata[@"separator"] = value.lowercaseString;
+        } else if ([key isEqualToString:@"enabled"]) {
+            metadata[@"enabled"] = value.lowercaseString;
+        }
+    }
+
+    NSString *title = metadata[@"title"];
+    if (title.length == 0) {
+        return nil;
+    }
+
+    NSString *enabled = metadata[@"enabled"];
+    if ([enabled isEqualToString:@"false"] ||
+        [enabled isEqualToString:@"no"] ||
+        [enabled isEqualToString:@"0"]) {
+        return nil;
+    }
+
+    metadata[@"path"] = path;
+    return metadata;
+}
+
+- (void)addCommandFilesFromDirectory:(NSString *)directory
+                            intoMap:(NSMutableDictionary<NSString *, NSString *> *)map {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray<NSString *> *names =
+        [fm contentsOfDirectoryAtPath:directory error:nil];
+
+    for (NSString *name in [names sortedArrayUsingSelector:@selector(compare:)]) {
+        if (![[name pathExtension].lowercaseString isEqualToString:@"sh"]) {
+            continue;
+        }
+
+        NSString *path =
+            [directory stringByAppendingPathComponent:name];
+
+        BOOL isDirectory = NO;
+        if ([fm fileExistsAtPath:path isDirectory:&isDirectory] && !isDirectory) {
+            // Command files are keyed by basename.
+            map[name] = path;
+        }
+    }
+}
+
+- (NSArray<NSDictionary *> *)menuCommandEntries {
+    NSString *commandsDir =
+        [@"~/.config/dsh-desktop/commands.d" stringByExpandingTildeInPath];
+
+    NSMutableDictionary<NSString *, NSString *> *commands =
+        [NSMutableDictionary dictionary];
+
+    [self addCommandFilesFromDirectory:commandsDir intoMap:commands];
+
+    NSMutableArray<NSDictionary *> *entries =
+        [NSMutableArray array];
+
+    for (NSString *name in commands) {
+        NSDictionary *metadata =
+            [self menuCommandMetadataAtPath:commands[name]];
+        if (metadata != nil) {
+            [entries addObject:metadata];
+        }
+    }
+
+    [entries sortUsingComparator:
+        ^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+            NSInteger left = [a[@"order"] integerValue];
+            NSInteger right = [b[@"order"] integerValue];
+
+            if (left < right) {
+                return NSOrderedAscending;
+            }
+            if (left > right) {
+                return NSOrderedDescending;
+            }
+
+            return [a[@"title"] compare:b[@"title"]
+                                options:NSCaseInsensitiveSearch];
+        }];
+
+    return entries;
+}
+
+- (void)applyShortcut:(NSString *)shortcut
+           toMenuItem:(NSMenuItem *)item {
+    if (shortcut.length == 0) {
+        return;
+    }
+
+    NSArray<NSString *> *parts =
+        [shortcut.lowercaseString componentsSeparatedByString:@"+"];
+
+    NSEventModifierFlags modifiers = 0;
+    NSString *key = nil;
+
+    for (NSString *rawPart in parts) {
+        NSString *part =
+            [rawPart stringByTrimmingCharactersInSet:
+                [NSCharacterSet whitespaceCharacterSet]];
+
+        if ([part isEqualToString:@"cmd"] ||
+            [part isEqualToString:@"command"]) {
+            modifiers |= NSEventModifierFlagCommand;
+        } else if ([part isEqualToString:@"shift"]) {
+            modifiers |= NSEventModifierFlagShift;
+        } else if ([part isEqualToString:@"option"] ||
+                   [part isEqualToString:@"alt"]) {
+            modifiers |= NSEventModifierFlagOption;
+        } else if ([part isEqualToString:@"ctrl"] ||
+                   [part isEqualToString:@"control"]) {
+            modifiers |= NSEventModifierFlagControl;
+        } else if (part.length > 0) {
+            key = part;
+        }
+    }
+
+    if ([key isEqualToString:@"space"]) {
+        key = @" ";
+    } else if ([key isEqualToString:@"comma"]) {
+        key = @",";
+    } else if ([key isEqualToString:@"period"]) {
+        key = @".";
+    }
+
+    if (key.length == 1) {
+        item.keyEquivalent = key;
+        item.keyEquivalentModifierMask = modifiers;
+    }
+}
+
+- (void)runMenuCommand:(NSMenuItem *)sender {
+    NSString *commandPath = sender.representedObject;
+    if (commandPath.length == 0) {
+        return;
+    }
+
+    NSString *runnerPath =
+        [[[NSBundle mainBundle] resourcePath]
+            stringByAppendingPathComponent:@"run-command.sh"];
+
+    NSTask *task = [[NSTask alloc] init];
+    task.executableURL = [NSURL fileURLWithPath:@"/bin/bash"];
+    task.arguments = @[ runnerPath, commandPath ];
+    task.standardOutput = [NSFileHandle fileHandleWithNullDevice];
+    task.standardError = [NSFileHandle fileHandleWithNullDevice];
+
+    NSError *error = nil;
+    if (![task launchAndReturnError:&error]) {
+        [self showLauncherError:
+            [NSString stringWithFormat:@"Failed to run menu command: %@",
+                                       error.localizedDescription]];
+    }
+}
+
+- (void)reloadUI:(id)sender {
+    (void)sender;
+
+    if (self.backendReady) {
+        [self showWindowAndLoadIfNeeded:YES];
+    } else if (!self.launcherRunning) {
+        [self startBackend];
+    }
+}
+
+- (void)showWindowAction:(id)sender {
+    (void)sender;
+
+    if (self.backendReady) {
+        [self showWindowAndLoadIfNeeded:NO];
+    } else if (!self.launcherRunning) {
+        [self startBackend];
+    }
+}
+
+- (void)installStatusMenu {
+    if (self.statusItem == nil) {
+        self.statusItem =
+            [[NSStatusBar systemStatusBar]
+                statusItemWithLength:NSVariableStatusItemLength];
+
+        NSStatusBarButton *button = self.statusItem.button;
+        button.title = @"DSH";
+        button.toolTip = @"DS Harness";
+    }
+
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"DS Harness"];
+
+    NSMenuItem *openItem =
+        [[NSMenuItem alloc] initWithTitle:@"Open DS Harness"
+                                  action:@selector(showWindowAction:)
+                           keyEquivalent:@""];
+    openItem.target = self;
+    [menu addItem:openItem];
+
+    NSMenuItem *reloadItem =
+        [[NSMenuItem alloc] initWithTitle:@"Reload UI"
+                                  action:@selector(reloadUI:)
+                           keyEquivalent:@"r"];
+    reloadItem.target = self;
+    [menu addItem:reloadItem];
+
+    NSArray<NSDictionary *> *entries = [self menuCommandEntries];
+
+    if (entries.count > 0) {
+        [menu addItem:[NSMenuItem separatorItem]];
+    }
+
+    for (NSDictionary *entry in entries) {
+        NSString *separator = entry[@"separator"];
+
+        if ([separator isEqualToString:@"before"] &&
+            menu.itemArray.lastObject != nil &&
+            ![menu.itemArray.lastObject isSeparatorItem]) {
+            [menu addItem:[NSMenuItem separatorItem]];
+        }
+
+        NSMenuItem *item =
+            [[NSMenuItem alloc] initWithTitle:entry[@"title"]
+                                      action:@selector(runMenuCommand:)
+                               keyEquivalent:@""];
+
+        item.target = self;
+        item.representedObject = entry[@"path"];
+        [self applyShortcut:entry[@"shortcut"] toMenuItem:item];
+        [menu addItem:item];
+
+        if ([separator isEqualToString:@"after"]) {
+            [menu addItem:[NSMenuItem separatorItem]];
+        }
+    }
+
+    if (menu.itemArray.lastObject != nil &&
+        ![menu.itemArray.lastObject isSeparatorItem]) {
+        [menu addItem:[NSMenuItem separatorItem]];
+    }
+
+    NSMenuItem *quitItem =
+        [[NSMenuItem alloc] initWithTitle:@"Quit DS Harness"
+                                  action:@selector(terminate:)
+                           keyEquivalent:@"q"];
+    quitItem.target = NSApp;
+    [menu addItem:quitItem];
+
+    self.statusItem.menu = menu;
+}
+
 - (void)installMainMenu {
     NSMenu *mainMenu = [[NSMenu alloc] initWithTitle:@""];
 
-    // Application menu
     NSMenuItem *appMenuItem =
         [[NSMenuItem alloc] initWithTitle:@""
                                   action:nil
@@ -1013,6 +1445,48 @@ static NSString * const DSHURLString = @"http://127.0.0.1:3080";
     [appMenu addItem:aboutItem];
 
     [appMenu addItem:[NSMenuItem separatorItem]];
+
+    NSMenuItem *reloadItem =
+        [[NSMenuItem alloc] initWithTitle:@"Reload UI"
+                                  action:@selector(reloadUI:)
+                           keyEquivalent:@"r"];
+    reloadItem.target = self;
+    [appMenu addItem:reloadItem];
+
+    NSArray<NSDictionary *> *entries = [self menuCommandEntries];
+
+    if (entries.count > 0) {
+        [appMenu addItem:[NSMenuItem separatorItem]];
+    }
+
+    for (NSDictionary *entry in entries) {
+        NSString *separator = entry[@"separator"];
+
+        if ([separator isEqualToString:@"before"] &&
+            appMenu.itemArray.lastObject != nil &&
+            ![appMenu.itemArray.lastObject isSeparatorItem]) {
+            [appMenu addItem:[NSMenuItem separatorItem]];
+        }
+
+        NSMenuItem *item =
+            [[NSMenuItem alloc] initWithTitle:entry[@"title"]
+                                      action:@selector(runMenuCommand:)
+                               keyEquivalent:@""];
+
+        item.target = self;
+        item.representedObject = entry[@"path"];
+        [self applyShortcut:entry[@"shortcut"] toMenuItem:item];
+        [appMenu addItem:item];
+
+        if ([separator isEqualToString:@"after"]) {
+            [appMenu addItem:[NSMenuItem separatorItem]];
+        }
+    }
+
+    if (appMenu.itemArray.lastObject != nil &&
+        ![appMenu.itemArray.lastObject isSeparatorItem]) {
+        [appMenu addItem:[NSMenuItem separatorItem]];
+    }
 
     NSMenuItem *hideItem =
         [[NSMenuItem alloc] initWithTitle:@"Hide DS Harness"
@@ -1049,9 +1523,8 @@ static NSString * const DSHURLString = @"http://127.0.0.1:3080";
     appMenuItem.submenu = appMenu;
     [mainMenu addItem:appMenuItem];
 
-    // Edit menu.
-    // Targets are nil intentionally: AppKit routes these actions through the
-    // responder chain, so the focused WKWebView/editable element receives them.
+    // Standard Edit menu. Nil targets intentionally use AppKit's responder
+    // chain so Copy/Paste/Undo work correctly inside WKWebView.
     NSMenuItem *editMenuItem =
         [[NSMenuItem alloc] initWithTitle:@"Edit"
                                   action:nil
@@ -1117,12 +1590,22 @@ static NSString * const DSHURLString = @"http://127.0.0.1:3080";
     (void)notification;
 
     [self installMainMenu];
+    [self installStatusMenu];
 
     self.launcherPath =
         [[[NSBundle mainBundle] resourcePath]
             stringByAppendingPathComponent:@"launcher.sh"];
 
     [self startBackend];
+}
+
+- (void)applicationDidBecomeActive:(NSNotification *)notification {
+    (void)notification;
+
+    // Re-scan ~/.config/dsh-desktop/commands.d whenever the app becomes
+    // active, so menu customizations do not require rebuilding the app.
+    [self installMainMenu];
+    [self installStatusMenu];
 }
 
 - (void)showLauncherError:(NSString *)message {

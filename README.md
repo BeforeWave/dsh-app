@@ -149,6 +149,96 @@ DSH_HOME=~/.dsh
 
 Your DSH configuration is not copied, replaced, or removed by DS Harness.
 
+## Desktop configuration
+
+DS Harness desktop-side customization is read directly from:
+
+```text
+~/.config/dsh-desktop/
+├── env.sh
+├── healthcheck.sh
+├── pre-start.d/
+├── post-ready.d/
+└── commands.d/
+```
+
+All files are optional. DS Harness does **not** create, copy, overwrite, or mutate this directory. There are no built-in command files in the app bundle; this directory is the single source of truth for desktop customization.
+
+### Environment
+
+If present, `env.sh` is sourced before DS Harness resolves or starts the backend, and is also sourced when a menu command runs.
+
+Example:
+
+```bash
+# ~/.config/dsh-desktop/env.sh
+export HTTPS_PROXY="http://127.0.0.1:7890"
+```
+
+### Lifecycle hooks
+
+Scripts in `pre-start.d/*.sh` run before a DS Harness-managed backend is started. If any pre-start hook fails, startup is aborted.
+
+Scripts in `post-ready.d/*.sh` run after the backend becomes healthy. Post-ready hook failures are logged but do not prevent the desktop UI from opening.
+
+Hook output is written to:
+
+```text
+~/Library/Logs/DS Harness/extensions.log
+```
+
+### Custom health check
+
+If `healthcheck.sh` exists, DS Harness uses it instead of the default HTTP readiness check against `http://127.0.0.1:3080`. A zero exit status means the backend is healthy.
+
+### Configurable native menu commands
+
+Each `commands.d/*.sh` file containing `# @menu` metadata becomes a native menu action. The same configured actions are shown in both the **DS Harness** application menu and the right-side macOS status menu.
+
+Example:
+
+```bash
+#!/bin/bash
+# @menu Restart Backend
+# @shortcut cmd+shift+r
+# @order 10
+# @separator before
+
+launchctl kickstart -k \
+  "gui/$(id -u)/${DSH_DESKTOP_SERVICE_LABEL}"
+```
+
+Supported metadata:
+
+```text
+@menu       required menu title
+@shortcut   e.g. cmd+r, cmd+shift+r, cmd+option+l
+@order      numeric sort order; default 100
+@separator  before or after
+@enabled    true/false
+```
+
+The command list is re-scanned whenever DS Harness becomes active, so changing `commands.d` does not require rebuilding the app. `Reload UI` and the standard macOS items such as About, Hide, Edit, and Quit remain built into the host.
+
+Extension scripts receive these environment variables:
+
+```text
+DSH_DESKTOP_CONFIG_DIR
+DSH_DESKTOP_SUPPORT_DIR
+DSH_DESKTOP_LOG_DIR
+DSH_DESKTOP_SERVICE_LABEL
+DSH_DESKTOP_URL
+DSH_HOME
+```
+
+A useful optional command is `commands.d/check-for-updates.sh`: it compares the current DSH version with `@deepseek-ai/dsh@latest`. If an update is available, the menu presents a single **Update** action; the script handles the underlying runtime automatically. The currently running backend is never interrupted.
+
+Menu command stdout/stderr is written to:
+
+```text
+~/Library/Logs/DS Harness/commands.log
+```
+
 ## Background service
 
 The managed launchd service is:
