@@ -415,7 +415,6 @@ PLIST="$SUPPORT_DIR/$LABEL.plist"
 RUNNER="$SUPPORT_DIR/run-dsh.sh"
 
 MODE_FILE="$SUPPORT_DIR/mode"
-DSH_PATH_FILE="$SUPPORT_DIR/dsh-path"
 NPX_PATH_FILE="$SUPPORT_DIR/npx-path"
 NPM_PATH_FILE="$SUPPORT_DIR/npm-path"
 NODE_PATH_FILE="$SUPPORT_DIR/node-path"
@@ -430,6 +429,14 @@ CONFIG_DIR="$HOME/.config/dsh-desktop"
 # launcher logic. If the launcher logic changes in a future app build, the
 # managed backend is restarted with freshly generated runtime files.
 LAUNCHER_BUILD_ID="__LAUNCHER_BUILD_ID__"
+
+# Bump this when the on-disk launchd runtime format changes.  This is
+# deliberately independent of the launcher hash so stale generated runtime
+# files are rebuilt even if a previous build recorded the wrong build id.
+# Runtime v3: dsh/npx executable paths are resolved inside zsh -lic at launch
+# time; stale package-manager absolute paths are never trusted.
+RUNTIME_SCHEMA="3"
+RUNTIME_SCHEMA_FILE="$SUPPORT_DIR/runtime-schema"
 
 # Known historical launcher identities owned by this project.
 # Keep LABEL stable from now on; add future retired labels here if necessary.
@@ -574,11 +581,14 @@ migrate_legacy_runtime() {
 refresh_managed_runtime_if_needed() {
   local domain
   local installed_build_id=""
+  local installed_runtime_schema=""
 
   domain="gui/$(id -u)"
   installed_build_id="$(cat "$LAUNCHER_BUILD_ID_FILE" 2>/dev/null || true)"
+  installed_runtime_schema="$(cat "$RUNTIME_SCHEMA_FILE" 2>/dev/null || true)"
 
-  if [ "$installed_build_id" = "$LAUNCHER_BUILD_ID" ]; then
+  if [ "$installed_build_id" = "$LAUNCHER_BUILD_ID" ] && \
+     [ "$installed_runtime_schema" = "$RUNTIME_SCHEMA" ]; then
     return 0
   fi
 
@@ -588,6 +598,17 @@ refresh_managed_runtime_if_needed() {
     /bin/launchctl bootout "$domain/$LABEL" >/dev/null 2>&1 || true
     wait_for_backend_down || true
   fi
+
+  # Generated runtime files are disposable. Remove stale path caches from
+  # older launchers so a dead absolute path can never survive a refresh.
+  /bin/rm -f \
+    "$RUNNER" \
+    "$PLIST" \
+    "$MODE_FILE" \
+    "$SUPPORT_DIR/dsh-path" \
+    "$NPX_PATH_FILE" \
+    "$RUNTIME_PATH_FILE" \
+    >/dev/null 2>&1 || true
 
   return 0
 }
@@ -640,7 +661,6 @@ latest_version() {
 
 configure_runtime() {
   local runtime_path
-  local dsh_bin
   local npx_bin
   local npm_bin
   local latest
@@ -653,17 +673,23 @@ configure_runtime() {
     printf '%s\n' "$npm_bin" > "$NPM_PATH_FILE"
   fi
 
-  dsh_bin="$(find_command dsh || true)"
-
-  # Validate dsh by running it with the resolved Node PATH.
-  if [ -n "$dsh_bin" ] && \
-     env PATH="$runtime_path" "$dsh_bin" --version >/dev/null 2>&1
+  # Resolve `dsh` inside the user's login+interactive shell every time.
+  # Do not persist an absolute dsh path: Homebrew/npm/nvm/fnm upgrades can
+  # move or replace the executable while the Desktop app is still installed.
+  if /bin/zsh -lic '
+    export HOME="$1"
+    export DSH_HOME="$2"
+    dsh_bin="$(command -v dsh 2>/dev/null || true)"
+    [ -n "$dsh_bin" ] && [ -x "$dsh_bin" ] || exit 1
+    "$dsh_bin" --version >/dev/null 2>&1
+  ' _ "$HOME" "$DSH_HOME" >/dev/null 2>&1
   then
     printf '%s\n' direct > "$MODE_FILE"
-    printf '%s\n' "$dsh_bin" > "$DSH_PATH_FILE"
+    /bin/rm -f "$SUPPORT_DIR/dsh-path" >/dev/null 2>&1 || true
     return 0
   fi
 
+  # No working dsh in the login shell: prepare the npx fallback.
   npx_bin="$(find_command npx || true)"
 
   if [ -z "$npx_bin" ]; then
@@ -673,7 +699,6 @@ Verify that Node.js/npm is installed correctly."
     return 1
   fi
 
-  # Validate npx with the explicit Node PATH as well.
   if ! env PATH="$runtime_path" "$npx_bin" --version >/dev/null 2>&1; then
     dialog_error "npx was found but could not run.
 
@@ -708,14 +733,9 @@ write_runner() {
 set -u
 
 SUPPORT_DIR="$HOME/Library/Application Support/DS Harness"
-
-MODE_FILE="$SUPPORT_DIR/mode"
-DSH_PATH_FILE="$SUPPORT_DIR/dsh-path"
-NPX_PATH_FILE="$SUPPORT_DIR/npx-path"
 VERSION_FILE="$SUPPORT_DIR/version"
 RUNTIME_PATH_FILE="$SUPPORT_DIR/runtime-path"
 
-mode="$(cat "$MODE_FILE" 2>/dev/null || true)"
 runtime_path="$(cat "$RUNTIME_PATH_FILE" 2>/dev/null || true)"
 
 if [ -z "$runtime_path" ]; then
@@ -723,13 +743,12 @@ if [ -z "$runtime_path" ]; then
   exit 127
 fi
 
-# Explicit user configuration home.
 export HOME="${HOME:?HOME is missing}"
 export DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
 export PATH="$runtime_path"
 
 # launchd does not inherit the launcher process environment, so source the
-# same repository/user-owned desktop config here as well.
+# repository/user-owned desktop config here as well. This file is read only.
 DESKTOP_CONFIG_DIR="$HOME/.config/dsh-desktop"
 set +u
 if [ -f "$DESKTOP_CONFIG_DIR/env.sh" ]; then
@@ -737,6 +756,8 @@ if [ -f "$DESKTOP_CONFIG_DIR/env.sh" ]; then
   source "$DESKTOP_CONFIG_DIR/env.sh"
 fi
 set -u
+
+version="$(cat "$VERSION_FILE" 2>/dev/null || true)"
 
 echo "DSH Launcher HOME: $HOME" >&2
 echo "DSH Launcher DSH_HOME: $DSH_HOME" >&2
@@ -746,56 +767,34 @@ if [ -f "$DSH_HOME/settings.yaml" ]; then
 else
   echo "DSH Launcher settings file: MISSING" >&2
 fi
-echo "DSH Launcher node: $(command -v node 2>/dev/null || echo MISSING)" >&2
-echo "DSH Launcher mode: $mode" >&2
 
-case "$mode" in
-  direct)
-    dsh_bin="$(cat "$DSH_PATH_FILE" 2>/dev/null || true)"
+# Resolve the executable at the moment launchd starts the service. Never use
+# an absolute dsh/npx path saved by a previous build or package-manager state.
+exec /bin/zsh -lic '
+  export HOME="$1"
+  export DSH_HOME="$2"
 
-    if [ -z "$dsh_bin" ] || [ ! -x "$dsh_bin" ]; then
-      echo "DSH executable missing: $dsh_bin" >&2
-      exit 127
-    fi
+  dsh_bin="$(command -v dsh 2>/dev/null || true)"
+  if [ -n "$dsh_bin" ] && [ -x "$dsh_bin" ]; then
+    echo "DSH Launcher runtime: $dsh_bin" >&2
+    exec "$dsh_bin" web
+  fi
 
-    # Start through user's login+interactive zsh so exports from ~/.zprofile /
-    # ~/.zshrc (e.g. TENCENT_TOKENHUB_API_KEY) are inherited, but then force
-    # HOME/DSH_HOME/PATH to the values resolved by the launcher.
-    exec /bin/zsh -lic '
-      export HOME="$1"
-      export DSH_HOME="$2"
-      export PATH="$3"
-      exec "$4" web
-    ' _ "$HOME" "$DSH_HOME" "$PATH" "$dsh_bin"
-    ;;
+  version="$3"
+  if [ -z "$version" ]; then
+    echo "DSH executable was not found and no fallback version is pinned." >&2
+    exit 127
+  fi
 
-  npx)
-    npx_bin="$(cat "$NPX_PATH_FILE" 2>/dev/null || true)"
-    version="$(cat "$VERSION_FILE" 2>/dev/null || true)"
+  npx_bin="$(command -v npx 2>/dev/null || true)"
+  if [ -z "$npx_bin" ] || [ ! -x "$npx_bin" ]; then
+    echo "Neither dsh nor npx was found in the login shell PATH." >&2
+    exit 127
+  fi
 
-    if [ -z "$npx_bin" ] || [ ! -x "$npx_bin" ]; then
-      echo "npx executable missing: $npx_bin" >&2
-      exit 127
-    fi
-
-    if [ -z "$version" ]; then
-      echo "Pinned DSH version missing." >&2
-      exit 1
-    fi
-
-    exec /bin/zsh -lic '
-      export HOME="$1"
-      export DSH_HOME="$2"
-      export PATH="$3"
-      exec "$4" -y "@deepseek-ai/dsh@$5" web
-    ' _ "$HOME" "$DSH_HOME" "$PATH" "$npx_bin" "$version"
-    ;;
-
-  *)
-    echo "Unknown DSH runtime mode: $mode" >&2
-    exit 1
-    ;;
-esac
+  echo "DSH Launcher runtime: $npx_bin @deepseek-ai/dsh@$version" >&2
+  exec "$npx_bin" -y "@deepseek-ai/dsh@$version" web
+' _ "$HOME" "$DSH_HOME" "$version"
 EOF
 
   chmod +x "$RUNNER"
@@ -895,8 +894,9 @@ $LOG_DIR/web-error.log"
     return 1
   fi
 
-  # Record the launcher build only after launchd accepted the new job.
+  # Record the launcher/runtime format only after launchd accepted the new job.
   printf '%s\n' "$LAUNCHER_BUILD_ID" > "$LAUNCHER_BUILD_ID_FILE"
+  printf '%s\n' "$RUNTIME_SCHEMA" > "$RUNTIME_SCHEMA_FILE"
 
   local i=0
   while [ "$i" -lt 600 ]; do
@@ -918,24 +918,23 @@ $LOG_DIR/web-error.log"
 
 current_version() {
   local mode
-  local runtime_path
-  local dsh_bin
 
   mode="$(cat "$MODE_FILE" 2>/dev/null || true)"
-  runtime_path="$(cat "$RUNTIME_PATH_FILE" 2>/dev/null || true)"
 
   if [ "$mode" = "npx" ]; then
     cat "$VERSION_FILE" 2>/dev/null || true
     return 0
   fi
 
-  dsh_bin="$(cat "$DSH_PATH_FILE" 2>/dev/null || true)"
-
-  if [ -n "$dsh_bin" ] && [ -x "$dsh_bin" ]; then
-    env PATH="$runtime_path" "$dsh_bin" --version 2>/dev/null \
-      | /usr/bin/grep -Eo '[0-9]+\.[0-9]+\.[0-9]+[-+._A-Za-z0-9]*' \
-      | /usr/bin/head -n 1 || true
-  fi
+  # Same rule as the runner: resolve dsh from the current login shell instead
+  # of trusting an absolute path saved by an earlier launch.
+  /bin/zsh -lic '
+    dsh_bin="$(command -v dsh 2>/dev/null || true)"
+    [ -n "$dsh_bin" ] && [ -x "$dsh_bin" ] || exit 1
+    "$dsh_bin" --version
+  ' 2>/dev/null \
+    | /usr/bin/grep -Eo '[0-9]+\.[0-9]+\.[0-9]+[-+._A-Za-z0-9]*' \
+    | /usr/bin/head -n 1 || true
 }
 
 check_update_async() {
